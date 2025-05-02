@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+python-dotenv
+pinecone
+docling 
+openai>=1.0.0 
+sentence-transformers 
+scikit-learn 
+langchain-text-splitters 
