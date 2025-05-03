@@ -3,34 +3,20 @@ from typing import List, Dict, Any, Optional, Union
 from dotenv import load_dotenv
 from pinecone import Pinecone
 from dataclasses import dataclass
-try:
-    from copy.core.base.providers.base import EmbeddingProvider
-    from copy.core.providers.embeddings.openai import OpenAIEmbeddingProvider
-    from copy.core.providers.llm import OpenAICompletionProvider
-except ImportError as e:
-    print(f"Warning: Could not import R2R providers from 'copy/'. Using placeholders. Error: {e}")
-    class EmbeddingProvider:
-        def get_embedding(self, text: str) -> List[float]:
-            print("WARN: Using Placeholder EmbeddingProvider.get_embedding")
-            return [0.0] * 10   
-        
-        def get_embeddings(self, texts: List[str]) -> List[List[float]]:
-            print("WARN: Using Placeholder EmbeddingProvider.get_embeddings")
-            return [[0.0] * 10] * len(texts)       
-        
-    class OpenAIEmbeddingProvider(EmbeddingProvider):
-        def __init__(self, config):
-            print("WARN: Using Placeholder OpenAIEmbeddingProvider")
-            pass
-            
-    class OpenAICompletionProvider:
-        def __init__(self, config):
-            print("WARN: Using Placeholder OpenAICompletionProvider")
-            pass
-            
-        def complete(self, prompt: str) -> str:
-            print("WARN: Using Placeholder OpenAICompletionProvider.complete")
-            return f"Expanded query for: {prompt}"
+from src.providers.embedding import EmbeddingProvider, OpenAIEmbeddingProvider
+
+# TODO : Add LLM provider
+class PlaceholderLLMProvider:
+    def __init__(self, config):
+        print(f"WARN: Using PlaceholderLLMProvider with config: {config}")
+        pass
+    def complete(self, prompt: str) -> str:
+        print("WARN: Using PlaceholderLLMProvider.complete")
+        # TODO : Simple expansion placeholder
+        return f"{prompt} | asset allocation strategies | portfolio management techniques | risk analysis"
+
+# TODO : Use the placeholder for OpenAICompletionProvider if the real one isn't defined elsewhere
+OpenAICompletionProvider = PlaceholderLLMProvider
 
 try:
     from sentence_transformers import CrossEncoder
@@ -38,6 +24,7 @@ try:
 except ImportError:
     print("Warning: sentence-transformers not available. Reranking will be disabled.")
     RERANKER_AVAILABLE = False
+    CrossEncoder = None 
 
 @dataclass
 class RetrievedChunk:
@@ -58,6 +45,14 @@ class RetrievalPipeline:
         self.embedding_provider_name = os.getenv("EMBEDDING_MODEL_PROVIDER", "openai").lower()
         self.embedding_model = os.getenv("EMBEDDING_MODEL_NAME", "text-embedding-ada-002")
         
+        # Sample embedngs here for now.
+        self.model_dimensions = {
+            "text-embedding-ada-002": 1536,
+            "text-embedding-3-small": 1536,
+            "text-embedding-3-large": 3072,
+        }
+        self.embedding_dimension = int(os.getenv("EMBEDDING_DIMENSION", self.model_dimensions.get(self.embedding_model, 1536)))
+        
         
         self.use_query_expansion = os.getenv("USE_QUERY_EXPANSION", "false").lower() == "true"
         self.query_expansion_provider = os.getenv("QUERY_EXPANSION_PROVIDER", "openai").lower()
@@ -77,7 +72,7 @@ class RetrievalPipeline:
         self.pinecone_index_name = os.getenv("PINECONE_INDEX_NAME")
         
         print(f"Initializing Retrieval Pipeline...")
-        print(f"Embedding Provider: {self.embedding_provider_name} (Model: {self.embedding_model})")
+        print(f"Embedding Provider: {self.embedding_provider_name} (Model: {self.embedding_model}, Dimension: {self.embedding_dimension})")
         print(f"Search Top-K: {self.search_top_k}")
         
         if self.use_query_expansion:
@@ -107,16 +102,12 @@ class RetrievalPipeline:
             if not api_key:
                 raise ValueError("OPENAI_API_KEY is required for OpenAIEmbeddingProvider.")
             
-            
-            from types import SimpleNamespace
-            config = SimpleNamespace(
-                provider="openai",
-                base_model=self.embedding_model,
-                base_dimension=None  
-            )
-            
             try:
-                return OpenAIEmbeddingProvider(config=config)
+                return OpenAIEmbeddingProvider(
+                    api_key=api_key,
+                    model=self.embedding_model,
+                    dimension=self.embedding_dimension
+                )
             except Exception as e:
                 print(f"Error loading OpenAIEmbeddingProvider: {e}")
                 raise
@@ -130,8 +121,9 @@ class RetrievalPipeline:
         if self.query_expansion_provider == "openai":
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
-                raise ValueError("OPENAI_API_KEY is required for OpenAICompletionProvider.")
-            
+                print("Warning: OPENAI_API_KEY not found. Query expansion disabled.")
+                self.use_query_expansion = False
+                return None
             
             from types import SimpleNamespace
             config = SimpleNamespace(
@@ -142,12 +134,14 @@ class RetrievalPipeline:
             try:
                 return OpenAICompletionProvider(config=config)
             except Exception as e:
-                print(f"Error loading OpenAICompletionProvider: {e}")
+                print(f"Error loading OpenAICompletionProvider (Placeholder): {e}")
                 self.use_query_expansion = False
                 print("Query Expansion disabled due to provider loading error.")
                 return None
         else:
-            raise ValueError(f"Unsupported query expansion provider: {self.query_expansion_provider}")
+            print(f"Warning: Unsupported query expansion provider '{self.query_expansion_provider}'. Query expansion disabled.")
+            self.use_query_expansion = False
+            return None
     
     def _load_reranker(self) -> Any:
         """Load the reranker model if available."""
@@ -252,7 +246,16 @@ class RetrievalPipeline:
         
         
         print("Generating query embedding...")
-        query_embedding = self.embedding_provider.get_embedding(expanded_query)
+        try:
+            query_embedding_list = self.embedding_provider.get_embeddings([expanded_query])
+            if not query_embedding_list:
+                 print("Error: Failed to generate embedding for the query.")
+                 return []
+            query_embedding = query_embedding_list[0]
+            print(f"Generated query embedding with dimension {len(query_embedding)}.")
+        except Exception as e:
+            print(f"Error generating query embedding: {e}")
+            return []
         
         
         filter_dict = {}
@@ -268,12 +271,16 @@ class RetrievalPipeline:
         
         
         print(f"Searching Pinecone for top {top_k} matches...")
-        search_results = self.pinecone_index.query(
-            vector=query_embedding,
-            top_k=top_k,
-            include_metadata=True,
-            filter=filter_condition
-        )
+        try:
+            search_results = self.pinecone_index.query(
+                vector=query_embedding,
+                top_k=top_k,
+                filter=filter_condition if filter_condition else None,
+                include_metadata=True
+            )
+        except Exception as e:
+            print(f"Error during Pinecone query: {e}")
+            return []
         
         
         retrieved_chunks = []
@@ -297,7 +304,7 @@ class RetrievalPipeline:
             print(f"Reranking results...")
             
             
-            pairs = [(query, chunk.text) for chunk in retrieved_chunks]
+            pairs = [(expanded_query, chunk.text) for chunk in retrieved_chunks]
             
             
             rerank_scores = self.reranker.predict(pairs)

@@ -1,12 +1,14 @@
 import os
 import uuid
 from typing import List, Dict, Any
-from docling.document_converter import DocumentConverter
 from dotenv import load_dotenv
 from pinecone import Pinecone, ServerlessSpec
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import openai
 from openai import OpenAI
+from unstructured_client import UnstructuredClient
+from unstructured_client.models import shared
+from unstructured_client.models.errors import SDKError
 
 class EmbeddingProvider:
     def get_embeddings(self, texts: List[str]) -> List[List[float]]:
@@ -137,6 +139,10 @@ load_dotenv()
 class IngestionPipeline:
     def __init__(self):
         print("Initializing Ingestion Pipeline...")
+        self.unstructured_api_key = os.getenv("UNSTRUCTURED_API_KEY")
+        if not self.unstructured_api_key:
+            raise ValueError("UNSTRUCTURED_API_KEY environment variable not set.")
+        self.unstructured_client = UnstructuredClient(api_key_auth=self.unstructured_api_key)
         self.embedding_provider_name = os.getenv("EMBEDDING_MODEL_PROVIDER", "openai").lower()
         self.embedding_model = os.getenv("EMBEDDING_MODEL_NAME", "text-embedding-ada-002")
         self.model_dimensions = {
@@ -210,101 +216,170 @@ class IngestionPipeline:
             raise ValueError(f"Unsupported vector DB provider: {self.vector_db_provider_name}")
 
     def parse_file(self, file_path: str, additional_metadata: Dict[str, Any] = None) -> List[Dict[str, Any]]:
-        print(f"Parsing file with docling: {file_path}...")
+        """
+        Parses a local file using the Unstructured API partition endpoint.
+
+        Args:
+            file_path: Path to the local file.
+            additional_metadata: Optional metadata to add to each element.
+
+        Returns:
+            A list of dictionaries, each representing a structured element
+            with 'text' and 'metadata' keys.
+        """
+        
+        print(f"Parsing file with Unstructured API: {file_path}")
+        if not os.path.exists(file_path):
+            print(f"Error: File not found at {file_path}")
+            return []
+        if additional_metadata is None:
+            additional_metadata = {}
+        base_metadata = {
+            "source": os.path.basename(file_path),
+            "file_path": file_path,
+            **additional_metadata 
+        }
         try:
-            converter = DocumentConverter()
-            result = converter.convert(file_path)
-            extracted_text = result.document.export_to_markdown()
-            if not extracted_text or not extracted_text.strip():
-                 print(f"Warning: Docling did not extract text from {file_path}")
-                 return []
-            file_name = os.path.basename(file_path)
-            base_metadata = {"source_document": file_name}
-            if additional_metadata:
-                base_metadata.update({k: v for k, v in additional_metadata.items() if v is not None})
-            parsed_data = [{"text": extracted_text, "metadata": base_metadata}]
-            print(f"Parsed {len(parsed_data)} element(s) with text using docling.")
-            if additional_metadata:
-                metadata_str = ", ".join([f"{k}: {v}" for k, v in additional_metadata.items() if v])
-                if metadata_str:
-                    print(f"Added base metadata: {metadata_str}")
-            return parsed_data
-        except ImportError:
-             print("Error: 'docling' library not found. Please install it: pip install docling")
-             raise
+            with open(file_path, "rb") as f:
+                req = shared.PartitionParameters(
+                    files=shared.Files(
+                        content=f.read(),
+                        file_name=os.path.basename(file_path)
+                    ),    
+                )
+                print(f"Sending {os.path.basename(file_path)} to Unstructured partition endpoint...")
+                resp = self.unstructured_client.general.partition(req)
+
+            elements = []
+            if resp.elements:
+                print(f"Received {len(resp.elements)} elements from Unstructured.")
+                for element_dict in resp.elements:
+                    
+                    element_text = element_dict.get('text', '')
+                    element_type = element_dict.get('type', 'Unknown')
+                    element_metadata = element_dict.get('metadata', {})
+
+                    
+                    combined_metadata = {
+                        **base_metadata,
+                        **element_metadata, 
+                        "element_type": element_type,
+                    }
+
+                    
+                    cleaned_metadata = {k: v for k, v in combined_metadata.items() if v is not None}
+
+                    elements.append({
+                        "text": element_text,
+                        "metadata": cleaned_metadata
+                    })
+            else:
+                print(f"Warning: Unstructured API returned no elements for {file_path}")
+
+            return elements
+
+        except SDKError as e:
+            print(f"Unstructured SDK Error processing {file_path}: {e}")
+            return []
         except Exception as e:
-            print(f"Error parsing file {file_path} with docling: {e}")
+            print(f"Unexpected error processing {file_path} with Unstructured: {e}")
             import traceback
             traceback.print_exc()
             return []
 
     def chunk_elements(self, elements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        print(f"Chunking {len(elements)} parsed elements...")
-        texts_to_chunk = [element['text'] for element in elements]
-        metadata_to_copy = [element['metadata'] for element in elements]
-        if not texts_to_chunk:
-            print("No text found in elements to chunk.")
-            return []
-        try:
-            langchain_docs = self.text_splitter.create_documents(
-                texts=texts_to_chunk,
-                metadatas=metadata_to_copy
-            )
-            final_chunks = [
-                {"text": doc.page_content, "metadata": doc.metadata}
-                for doc in langchain_docs
-            ]
-            print(f"Created {len(final_chunks)} chunks from {len(elements)} elements.")
-            return final_chunks
-        except Exception as e:
-            print(f"Error during chunking: {e}")
-            return []
+        """Chunks the text content of parsed elements."""
+        print(f"Chunking {len(elements)} elements...")
+        chunks = []
+        for i, element in enumerate(elements):
+            text = element.get("text")
+            metadata = element.get("metadata", {})
+            if not text:
+                print(f"Warning: Skipping element {i} with no text.")
+                continue
+
+            
+            split_texts = self.text_splitter.split_text(text)
+
+            for j, chunk_text in enumerate(split_texts):
+                chunk_metadata = metadata.copy() 
+                chunk_metadata["element_index"] = i 
+                chunk_metadata["chunk_index_in_element"] = j 
+                
+                
+
+                chunks.append({
+                    "text": chunk_text,
+                    "metadata": chunk_metadata
+                })
+        print(f"Produced {len(chunks)} chunks.")
+        return chunks
 
     def generate_embeddings(self, chunks: List[Dict[str, Any]]) -> List[List[float]]:
-        print(f"Generating embeddings for {len(chunks)} chunks...")
-        texts_to_embed = [chunk['text'] for chunk in chunks]
-        if not texts_to_embed:
+        """Generates embeddings for the text content of chunks."""
+        if not chunks:
+            print("No chunks provided for embedding.")
             return []
+
+        print(f"Generating embeddings for {len(chunks)} chunks...")
+        texts_to_embed = [chunk["text"] for chunk in chunks]
+
         try:
             embeddings = self.embedding_provider.get_embeddings(texts_to_embed)
+            if len(embeddings) != len(chunks):
+                print(f"Warning: Number of embeddings ({len(embeddings)}) does not match number of chunks ({len(chunks)}).")
+                
             print(f"Generated {len(embeddings)} embeddings.")
-            if embeddings and len(embeddings[0]) != self.embedding_dimension:
-                actual_dim = len(embeddings[0])
-                print(f"Note: Actual embedding dimension ({actual_dim}) differs from configured dimension ({self.embedding_dimension}). Updating internal dimension.")
-                self.embedding_dimension = actual_dim
             return embeddings
         except Exception as e:
             print(f"Error generating embeddings: {e}")
             return []
 
     def store_chunks(self, chunks: List[Dict[str, Any]], embeddings: List[List[float]]):
-        print(f"Storing {len(chunks)} chunks with embeddings...")
-        if not chunks or len(chunks) != len(embeddings):
-            print("Warning: Mismatch between chunks and embeddings count or empty lists. Skipping storage.")
+        """Stores chunks and their embeddings in the vector database."""
+        if not chunks or not embeddings or len(chunks) != len(embeddings):
+            print("Error: Mismatch between chunks and embeddings, or lists are empty. Skipping storage.")
+            if not chunks: print("  Reason: Chunks list is empty.")
+            if not embeddings: print("  Reason: Embeddings list is empty.")
+            if chunks and embeddings and len(chunks) != len(embeddings):
+                print(f"  Reason: Chunk count ({len(chunks)}) != Embedding count ({len(embeddings)}).")
             return
+
+        print(f"Preparing {len(chunks)} chunks for storage...")
+        metadata_list = [chunk["metadata"] for chunk in chunks]
         ids = [str(uuid.uuid4()) for _ in chunks]
-        metadata_list = [chunk['metadata'] for chunk in chunks]
+
         try:
             self.vector_db_provider.upsert(vectors=embeddings, metadata=metadata_list, ids=ids)
+            print(f"Successfully stored {len(ids)} chunks.")
         except Exception as e:
-            print(f"Error storing chunks: {e}")
+            print(f"Error storing chunks in vector DB: {e}")
 
     def run(self, file_path: str, metadata: Dict[str, Any] = None):
-        print(f"--- Starting Ingestion for {os.path.basename(file_path)} ---")
-        parsed_elements = self.parse_file(file_path, additional_metadata=metadata)
-        if not parsed_elements:
-            print("No elements parsed. Exiting.")
+        """Runs the full ingestion pipeline for a single file."""
+        print(f"\n----- Starting pipeline for: {file_path} -----")
+        if metadata:
+            print(f"Using provided metadata: {metadata}")
+
+        
+        elements = self.parse_file(file_path, additional_metadata=metadata)
+        if not elements:
+            print(f"Pipeline halted for {file_path}: No elements parsed.")
             return
-        chunks = self.chunk_elements(parsed_elements)
+
+        
+        chunks = self.chunk_elements(elements)
         if not chunks:
-            print("No chunks created. Exiting.")
+            print(f"Pipeline halted for {file_path}: No chunks generated.")
             return
+
+        
         embeddings = self.generate_embeddings(chunks)
-        if not embeddings:
-            if chunks:
-                 print("Embedding generation failed. Exiting.")
-            else:
-                 print("No embeddings generated (likely no text found). Exiting.")
+        if not embeddings or len(embeddings) != len(chunks):
+            print(f"Pipeline halted for {file_path}: Embedding generation failed or produced incorrect number of vectors.")
             return
+
+        
         self.store_chunks(chunks, embeddings)
-        print(f"--- Finished Ingestion for {os.path.basename(file_path)} ---")
+
+        print(f"----- Finished pipeline for: {file_path} -----")
