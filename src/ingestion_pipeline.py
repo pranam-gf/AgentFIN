@@ -7,7 +7,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 import openai
 from openai import OpenAI
 from unstructured_client import UnstructuredClient
-from unstructured_client.models import shared
+from unstructured_client.models import shared, operations
 from unstructured_client.models.errors import SDKError
 
 class EmbeddingProvider:
@@ -246,12 +246,16 @@ class IngestionPipeline:
                     file_name=os.path.basename(file_path)
                 )
 
-                req = shared.PartitionParameters(
+                params = shared.PartitionParameters(
                     files=files_arg,
                 )
 
+                req = operations.PartitionRequest(
+                    partition_parameters=params
+                )
+
                 print(f"Sending {os.path.basename(file_path)} to Unstructured partition endpoint...")
-                resp = self.unstructured_client.general.partition(req)
+                resp = self.unstructured_client.general.partition(request=req)
 
             elements = []
             if resp.elements:
