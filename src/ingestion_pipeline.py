@@ -241,12 +241,15 @@ class IngestionPipeline:
         }
         try:
             with open(file_path, "rb") as f:
-                req = shared.PartitionParameters(
-                    files=shared.Files(
-                        content=f.read(),
-                        file_name=os.path.basename(file_path)
-                    ),    
+                files_arg = shared.Files(
+                    content=f.read(),
+                    file_name=os.path.basename(file_path)
                 )
+
+                req = shared.PartitionParameters(
+                    files=files_arg,
+                )
+
                 print(f"Sending {os.path.basename(file_path)} to Unstructured partition endpoint...")
                 resp = self.unstructured_client.general.partition(req)
 
