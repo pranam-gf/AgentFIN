@@ -373,25 +373,21 @@ class IngestionPipeline:
         if metadata:
             print(f"Using provided metadata: {metadata}")
 
-        
         elements = self.parse_file(file_path, additional_metadata=metadata, strategy=strategy)
         if not elements:
             print(f"Pipeline halted for {file_path}: No elements parsed.")
             return
 
-        
-        chunks = self.chunk_elements(elements)
+        chunks = elements
         if not chunks:
-            print(f"Pipeline halted for {file_path}: No chunks generated.")
+            print(f"Pipeline halted for {file_path}: No chunks generated (from API).")
             return
 
-        
         embeddings = self.generate_embeddings(chunks)
         if not embeddings or len(embeddings) != len(chunks):
             print(f"Pipeline halted for {file_path}: Embedding generation failed or produced incorrect number of vectors.")
             return
 
-        
         self.store_chunks(chunks, embeddings)
 
         print(f"----- Finished pipeline for: {file_path} -----")
