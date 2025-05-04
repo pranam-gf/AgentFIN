@@ -1,4 +1,3 @@
-
 import os
 import sys
 import argparse
@@ -83,17 +82,16 @@ def main():
         for i, chunk in enumerate(results):
             print(f"\n=== Result {i+1} (Score: {chunk.score:.4f}) ===")
             print(f"Topic: {chunk.metadata.get('cfa_topic', 'Unknown')}")
-            print(f"Source: {chunk.metadata.get('source_document', 'Unknown')}")
+            print(f"Source: {chunk.metadata.get('source', 'Unknown')}")
             
             if args.verbose:
+                # Print detailed metadata if verbose flag is set
+                print("\nRaw Metadata:")
+                print(chunk.metadata) # DEBUG: Print raw metadata
                 
-                print("\nMetadata:")
-                for key, value in chunk.metadata.items():
-                    if key not in ['cfa_topic', 'source_document']:
-                        print(f"  {key}: {value}")
-            
             
             text = chunk.text
+            print(f"DEBUG: repr(text) = {repr(text)}") # DEBUG: Print representation of text
             if len(text) > 500 and not args.verbose:
                 text = text[:497] + "..."
             print(f"\nText: {text}")

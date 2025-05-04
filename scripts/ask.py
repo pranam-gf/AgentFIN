@@ -97,7 +97,7 @@ def main():
             else:
                 for i, chunk in enumerate(retrieved_chunks):
                     print(f"\n--- Chunk {i+1} (Score: {chunk.score:.4f}) ---")
-                    print(f"Source: {chunk.metadata.get('source_document', 'Unknown')}")
+                    print(f"Source: {chunk.metadata.get('source', 'Unknown')}")
                     print(f"Topic: {chunk.metadata.get('cfa_topic', 'Unknown')}")
                     
                     
@@ -133,7 +133,7 @@ def main():
             
             sources = set()
             for chunk in retrieved_chunks:
-                source = chunk.metadata.get('source_document', 'Unknown')
+                source = chunk.metadata.get('source', 'Unknown')
                 topic = chunk.metadata.get('cfa_topic', 'Unknown')
                 sources.add(f"- {source} (Topic: {topic})")
             

@@ -1,6 +1,6 @@
 import os
 import uuid
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from pinecone import Pinecone, ServerlessSpec
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -137,7 +137,10 @@ class PineconeProvider(VectorDBProvider):
 load_dotenv()
 
 class IngestionPipeline:
-    def __init__(self):
+    def __init__(self, 
+                 chunk_size_override: Optional[int] = None, 
+                 chunk_overlap_override: Optional[int] = None,
+                 chunking_strategy_override: Optional[str] = None):
         print("Initializing Ingestion Pipeline...")
         self.unstructured_api_key = os.getenv("UNSTRUCTURED_API_KEY")
         if not self.unstructured_api_key:
@@ -153,9 +156,10 @@ class IngestionPipeline:
         self.embedding_dimension = int(os.getenv("EMBEDDING_DIMENSION", self.model_dimensions.get(self.embedding_model, 1536)))
         print(f"Using embedding dimension: {self.embedding_dimension}")
         self.vector_db_provider_name = "pinecone"
-        self.chunk_size = int(os.getenv("CHUNK_SIZE", 1000))
-        self.chunk_overlap = int(os.getenv("CHUNK_OVERLAP", 100))
-        print(f"Chunk Size: {self.chunk_size}, Overlap: {self.chunk_overlap}")
+        self.chunk_size = chunk_size_override if chunk_size_override is not None else int(os.getenv("CHUNK_SIZE", 1000))
+        self.chunk_overlap = chunk_overlap_override if chunk_overlap_override is not None else int(os.getenv("CHUNK_OVERLAP", 100))
+        self.chunking_strategy = chunking_strategy_override if chunking_strategy_override is not None else os.getenv("CHUNKING_STRATEGY", "basic")
+        print(f"Chunk Size: {self.chunk_size}, Overlap: {self.chunk_overlap}, Chunking Strategy: {self.chunking_strategy}")
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
@@ -215,20 +219,20 @@ class IngestionPipeline:
         else:
             raise ValueError(f"Unsupported vector DB provider: {self.vector_db_provider_name}")
 
-    def parse_file(self, file_path: str, additional_metadata: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+    def parse_file(self, file_path: str, additional_metadata: Dict[str, Any] = None, strategy: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Parses a local file using the Unstructured API partition endpoint.
 
         Args:
             file_path: Path to the local file.
             additional_metadata: Optional metadata to add to each element.
+            strategy: Optional partitioning strategy (e.g., 'hi_res', 'fast').
 
         Returns:
             A list of dictionaries, each representing a structured element
             with 'text' and 'metadata' keys.
         """
-        
-        print(f"Parsing file with Unstructured API: {file_path}")
+        print(f"Parsing file with Unstructured API: {file_path}" + (f" using strategy \'{strategy}\'" if strategy else ""))
         if not os.path.exists(file_path):
             print(f"Error: File not found at {file_path}")
             return []
@@ -237,8 +241,9 @@ class IngestionPipeline:
         base_metadata = {
             "source": os.path.basename(file_path),
             "file_path": file_path,
-            **additional_metadata 
+            **additional_metadata
         }
+        elements = []
         try:
             with open(file_path, "rb") as f:
                 files_arg = shared.Files(
@@ -246,36 +251,33 @@ class IngestionPipeline:
                     file_name=os.path.basename(file_path)
                 )
 
-                params = shared.PartitionParameters(
-                    files=files_arg,
-                )
+                partition_args = {
+                    "files": files_arg,
+                    "chunking_strategy": self.chunking_strategy
+                }
+                if strategy:
+                    partition_args["strategy"] = strategy
+
+                print(f"Sending {os.path.basename(file_path)} to Unstructured partition endpoint with config: {partition_args}...")
 
                 req = operations.PartitionRequest(
-                    partition_parameters=params
+                    partition_parameters=shared.PartitionParameters(**partition_args)
                 )
 
-                print(f"Sending {os.path.basename(file_path)} to Unstructured partition endpoint...")
-                resp = self.unstructured_client.general.partition(request=req)
+                response = self.unstructured_client.general.partition(req)
 
-            elements = []
-            if resp.elements:
-                print(f"Received {len(resp.elements)} elements from Unstructured.")
-                for element_dict in resp.elements:
-                    
+            if response.elements:
+                print(f"Received {len(response.elements)} elements from Unstructured.")
+                for element_dict in response.elements:
                     element_text = element_dict.get('text', '')
                     element_type = element_dict.get('type', 'Unknown')
                     element_metadata = element_dict.get('metadata', {})
-
-                    
                     combined_metadata = {
                         **base_metadata,
-                        **element_metadata, 
+                        **element_metadata,
                         "element_type": element_type,
                     }
-
-                    
                     cleaned_metadata = {k: v for k, v in combined_metadata.items() if v is not None}
-
                     elements.append({
                         "text": element_text,
                         "metadata": cleaned_metadata
@@ -283,16 +285,14 @@ class IngestionPipeline:
             else:
                 print(f"Warning: Unstructured API returned no elements for {file_path}")
 
-            return elements
-
         except SDKError as e:
             print(f"Unstructured SDK Error processing {file_path}: {e}")
-            return []
         except Exception as e:
             print(f"Unexpected error processing {file_path} with Unstructured: {e}")
             import traceback
             traceback.print_exc()
-            return []
+
+        return elements
 
     def chunk_elements(self, elements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Chunks the text content of parsed elements."""
@@ -353,7 +353,12 @@ class IngestionPipeline:
             return
 
         print(f"Preparing {len(chunks)} chunks for storage...")
-        metadata_list = [chunk["metadata"] for chunk in chunks]
+        metadata_list = []
+        for chunk in chunks:
+            chunk_meta = chunk["metadata"].copy()
+            chunk_meta["text"] = chunk.get("text", "")
+            metadata_list.append(chunk_meta)
+            
         ids = [str(uuid.uuid4()) for _ in chunks]
 
         try:
@@ -362,14 +367,14 @@ class IngestionPipeline:
         except Exception as e:
             print(f"Error storing chunks in vector DB: {e}")
 
-    def run(self, file_path: str, metadata: Dict[str, Any] = None):
+    def run(self, file_path: str, metadata: Dict[str, Any] = None, strategy: Optional[str] = None):
         """Runs the full ingestion pipeline for a single file."""
         print(f"\n----- Starting pipeline for: {file_path} -----")
         if metadata:
             print(f"Using provided metadata: {metadata}")
 
         
-        elements = self.parse_file(file_path, additional_metadata=metadata)
+        elements = self.parse_file(file_path, additional_metadata=metadata, strategy=strategy)
         if not elements:
             print(f"Pipeline halted for {file_path}: No elements parsed.")
             return
