@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+from typing import Optional
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, project_root)
@@ -69,6 +70,11 @@ def main():
     parser.add_argument("--chunking-strategy", type=str, default="basic", 
                         choices=["basic", "by_title", "by_page", "by_similarity"],
                         help="Unstructured chunking strategy to use (default: basic).")
+    parser.add_argument("--embedding-provider", type=str, default=os.getenv("EMBEDDING_PROVIDER", "openai"),
+                        choices=["openai"], 
+                        help="Embedding provider to use (e.g., openai, huggingface).")
+    parser.add_argument("--embedding-model-name", type=str, default=os.getenv("EMBEDDING_MODEL_NAME", "text-embedding-3-large"),
+                        help="Name of the embedding model to use (e.g., text-embedding-3-large, sentence-transformers/all-MiniLM-L6-v2).")
     args = parser.parse_args()
 
     input_path = args.input_path
@@ -118,7 +124,9 @@ def main():
         pipeline = IngestionPipeline(
             chunk_size_override=args.chunk_size,
             chunk_overlap_override=args.chunk_overlap,
-            chunking_strategy_override=args.chunking_strategy
+            chunking_strategy_override=args.chunking_strategy,
+            embedding_provider=args.embedding_provider,
+            embedding_model_name=args.embedding_model_name
         )
     except Exception as e:
         print(f"Error initializing Ingestion Pipeline: {e}")
