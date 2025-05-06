@@ -30,6 +30,9 @@ def main():
     
     load_dotenv()
     
+    # Temporary debug print:
+    print(f"DEBUG: Loaded SEARCH_TOP_K from .env = '{os.getenv('SEARCH_TOP_K')}'")
+    
     # TODO : ned to add a valudi method to check if the topic and pahway are valid
     core_topics, specialized_pathways = get_valid_cfa_topics()
     all_topics = core_topics + specialized_pathways

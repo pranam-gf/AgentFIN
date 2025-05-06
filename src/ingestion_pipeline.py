@@ -1,11 +1,13 @@
 import os
 import uuid
+import sys # Added for temporary exit
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from pinecone import Pinecone, ServerlessSpec
 from unstructured_client import UnstructuredClient
 from unstructured_client.models import shared, operations
 from unstructured_client.models.errors import SDKError
+from openai import OpenAI, APIError
 
 class VectorDBProvider:
     def upsert(self, vectors: List[List[float]], metadata: List[Dict[str, Any]], ids: List[str]):
@@ -110,15 +112,17 @@ class IngestionPipeline:
             raise ValueError("UNSTRUCTURED_API_KEY environment variable not set.")
         self.unstructured_client = UnstructuredClient(api_key_auth=self.unstructured_api_key)
 
-        self.embedding_api_key: Optional[str] = None
+        self.openai_client = None
         if self.embedding_provider_name == "openai":
-            self.embedding_api_key = os.getenv("OPENAI_API_KEY")
-            if not self.embedding_api_key:
-                print("Warning: OPENAI_API_KEY not set, which might be required for 'openai' embedding provider via Unstructured.")
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            if not openai_api_key:
+                raise ValueError("OPENAI_API_KEY environment variable not set for 'openai' embedding provider.")
+            self.openai_client = OpenAI(api_key=openai_api_key)
+            print("OpenAI client initialized.")
         # TODO : Add similar blocks for other providers in future for perfomacne
         
         self.embedding_dimension = self._get_embedding_dimension(self.embedding_model)
-        print(f"Using Embedding Provider: {self.embedding_provider_name}, Model: {self.embedding_model}, Dimension: {self.embedding_dimension}")
+        print(f"Using Embedding Provider (client-side): {self.embedding_provider_name}, Model: {self.embedding_model}, Dimension: {self.embedding_dimension}")
         
         self.vector_db_provider_name = "pinecone"
         self.chunk_size = chunk_size_override if chunk_size_override is not None else int(os.getenv("CHUNK_SIZE", 1000))
@@ -177,7 +181,8 @@ class IngestionPipeline:
 
     def parse_file(self, file_path: str, additional_metadata: Dict[str, Any] = None, strategy: Optional[str] = None) -> List[Dict[str, Any]]:
         """
-        Parses a local file using the Unstructured API partition endpoint.
+        Parses a local file using the Unstructured API partition endpoint,
+        then generates embeddings client-side.
 
         Args:
             file_path: Path to the local file.
@@ -186,9 +191,9 @@ class IngestionPipeline:
 
         Returns:
             A list of dictionaries, each representing a structured element
-            with 'text' and 'metadata' keys.
+            with 'text', 'metadata', and 'embeddings' keys.
         """
-        print(f"Parsing file with Unstructured API: {file_path}" + (f" using strategy \'{strategy}\'" if strategy else ""))
+        print(f"Parsing file with Unstructured API: {file_path}" + (f" using strategy '{strategy}'" if strategy else ""))
         if not os.path.exists(file_path):
             print(f"Error: File not found at {file_path}")
             return []
@@ -199,25 +204,28 @@ class IngestionPipeline:
             "file_path": file_path,
             **additional_metadata
         }
-        elements = []
+        
+        raw_elements = [] 
+
         try:
             with open(file_path, "rb") as f:
                 files_arg = shared.Files(
                     content=f.read(),
                     file_name=os.path.basename(file_path)
                 )
-
                 partition_args = {
                     "files": files_arg,
                     "chunking_strategy": self.chunking_strategy,
-                    "embedding_provider": self.embedding_provider_name,
-                    "embedding_model_name": self.embedding_model 
+                    # "embedding_provider": self.embedding_provider_name,
+                    # "embedding_model_name": self.embedding_model,      
+                    # "embedding_api_key": self.embedding_api_key       
                 }
+                if self.chunk_size: 
+                    partition_args["max_characters"] = self.chunk_size
+                    partition_args["overlap"] = self.chunk_overlap
+
                 partition_args = {k: v for k, v in partition_args.items() if v is not None}
                 
-                if self.embedding_api_key:
-                    partition_args["embedding_api_key"] = self.embedding_api_key
-
                 if strategy:
                     partition_args["strategy"] = strategy
 
@@ -232,14 +240,12 @@ class IngestionPipeline:
                 req = operations.PartitionRequest(
                     partition_parameters=shared.PartitionParameters(**partition_args)
                 )
-
                 response = self.unstructured_client.general.partition(request=req)
 
             if response.elements:
                 print(f"Received {len(response.elements)} elements from Unstructured.")
                 for element_dict in response.elements:
                     element_text = element_dict.get('text', '')
-                    element_embeddings = element_dict.get('embeddings', None) 
                     element_type = element_dict.get('type', 'Unknown')
                     element_metadata = element_dict.get('metadata', {})
                     combined_metadata = {
@@ -248,21 +254,70 @@ class IngestionPipeline:
                         "element_type": element_type,
                     }
                     cleaned_metadata = {k: v for k, v in combined_metadata.items() if v is not None}
-                    elements.append({
+                    raw_elements.append({ 
                         "text": element_text,
                         "metadata": cleaned_metadata,
-                        "embeddings": element_embeddings 
                     })
             else:
                 print(f"Warning: Unstructured API returned no elements for {file_path}")
+                return []
 
         except SDKError as e:
             print(f"Unstructured SDK Error processing {file_path}: {e}")
+            return []
         except Exception as e:
             print(f"Unexpected error processing {file_path} with Unstructured: {e}")
             import traceback
             traceback.print_exc()
-        return elements
+            return []
+
+        if not raw_elements:
+            return []
+
+        final_elements_with_embeddings = []
+        texts_to_embed = [el["text"] for el in raw_elements if el.get("text")]
+
+        if not texts_to_embed:
+            print(f"No text content found in elements from {file_path} to embed.")
+            for el in raw_elements:
+                el["embeddings"] = None
+                final_elements_with_embeddings.append(el)
+            return final_elements_with_embeddings
+
+        generated_embeddings = []
+        if self.embedding_provider_name == "openai" and self.openai_client:
+            print(f"Generating embeddings for {len(texts_to_embed)} text chunks using OpenAI model {self.embedding_model}...")
+            openai_batch_size = 100 
+            for i in range(0, len(texts_to_embed), openai_batch_size):
+                batch_texts = texts_to_embed[i:i + openai_batch_size]
+                try:
+                    res = self.openai_client.embeddings.create(input=batch_texts, model=self.embedding_model)
+                    generated_embeddings.extend([item.embedding for item in res.data])
+                    print(f"  Generated embeddings for batch {i//openai_batch_size + 1}/{ (len(texts_to_embed) -1)//openai_batch_size + 1 }")
+                except APIError as e:
+                    print(f"OpenAI API Error during embedding batch {i//openai_batch_size + 1}: {e}")
+                    generated_embeddings.extend([None] * len(batch_texts))
+                except Exception as e:
+                    print(f"Unexpected error during OpenAI embedding batch {i//openai_batch_size + 1}: {e}")
+                    generated_embeddings.extend([None] * len(batch_texts))
+        else:
+            print(f"Warning: Embedding provider '{self.embedding_provider_name}' is not configured for client-side embeddings or client not initialized. Skipping embedding.")
+            generated_embeddings = [None] * len(texts_to_embed)
+        
+        embedding_idx = 0
+        for raw_el in raw_elements:
+            final_element = raw_el.copy()
+            if raw_el.get("text") and embedding_idx < len(generated_embeddings):
+                final_element["embeddings"] = generated_embeddings[embedding_idx]
+                embedding_idx += 1
+            else:
+                final_element["embeddings"] = None 
+            final_elements_with_embeddings.append(final_element)
+            
+        if embedding_idx != len(generated_embeddings) and texts_to_embed: 
+             print(f"Warning: Mismatch in number of embeddings generated ({len(generated_embeddings)}) and text chunks that required embedding ({embedding_idx}).")
+
+        return final_elements_with_embeddings
 
     def store_chunks(self, chunks_with_embeddings: List[Dict[str, Any]]):
         """Stores chunks and their embeddings (extracted from the chunk dict) in the vector database."""
@@ -296,6 +351,26 @@ class IngestionPipeline:
         try:
             self.vector_db_provider.upsert(vectors=embeddings, metadata=metadata_list, ids=ids)
             print(f"Successfully stored {len(ids)} chunks.")
+
+            # ---- DEBUG CODE  ----
+            # if ids and hasattr(self.vector_db_provider, 'index') and self.vector_db_provider.index is not None:
+            #     print(f"\n--- DEBUG: Fetching vector with ID: {ids[0]} to inspect its metadata ---")
+            #     try:
+            #         fetch_response = self.vector_db_provider.index.fetch(ids=[ids[0]])
+            #         print(f"DEBUG: Fetch response: {fetch_response}")
+            #         if fetch_response and fetch_response.vectors:
+            #             for vector_id, vector_data in fetch_response.vectors.items():
+            #                 print(f"  Vector ID: {vector_id}")
+            #                 print(f"  Metadata: {vector_data.metadata}")
+            #                 # print(f"  Values: {vector_data.values}") # Optional: to see the vector values
+            #         else:
+            #             print("DEBUG: Vector not found or empty response.")
+            #     except Exception as e:
+            #         print(f"DEBUG: Error fetching vector by ID: {e}")
+            #     print("--- DEBUG: Halting after first successful store_chunks for inspection. REMOVE THIS FOR NORMAL OPERATION. ---")
+            #     sys.exit(0) # Or raise Exception("Debug halt")
+            # ---- DEBUG CODE END ----
+
         except Exception as e:
             print(f"Error storing chunks in vector DB: {e}")
 
