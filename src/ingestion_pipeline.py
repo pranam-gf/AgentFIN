@@ -110,6 +110,13 @@ class IngestionPipeline:
             raise ValueError("UNSTRUCTURED_API_KEY environment variable not set.")
         self.unstructured_client = UnstructuredClient(api_key_auth=self.unstructured_api_key)
 
+        self.embedding_api_key: Optional[str] = None
+        if self.embedding_provider_name == "openai":
+            self.embedding_api_key = os.getenv("OPENAI_API_KEY")
+            if not self.embedding_api_key:
+                print("Warning: OPENAI_API_KEY not set, which might be required for 'openai' embedding provider via Unstructured.")
+        # TODO : Add similar blocks for other providers in future for perfomacne
+        
         self.embedding_dimension = self._get_embedding_dimension(self.embedding_model)
         print(f"Using Embedding Provider: {self.embedding_provider_name}, Model: {self.embedding_model}, Dimension: {self.embedding_dimension}")
         
@@ -208,6 +215,9 @@ class IngestionPipeline:
                 }
                 partition_args = {k: v for k, v in partition_args.items() if v is not None}
                 
+                if self.embedding_api_key:
+                    partition_args["embedding_api_key"] = self.embedding_api_key
+
                 if strategy:
                     partition_args["strategy"] = strategy
 
