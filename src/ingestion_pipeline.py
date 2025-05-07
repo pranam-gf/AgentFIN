@@ -1,6 +1,7 @@
 import os
 import uuid
-import sys # Added for temporary exit
+import sys
+import hashlib
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from pinecone import Pinecone, ServerlessSpec
@@ -62,6 +63,20 @@ class PineconeProvider(VectorDBProvider):
             print(f"ERROR CAUGHT in PineconeProvider.__init__: {e}")
             import traceback
             traceback.print_exc()
+            raise
+
+    def clear_index(self):
+        """Deletes all vectors from the Pinecone index."""
+        if not self.index:
+            print("Error: Pinecone index is not initialized. Cannot clear.")
+            return
+        try:
+            print(f"Clearing all vectors from Pinecone index '{self.index.name}'...")
+            delete_response = self.index.delete(delete_all=True)
+            print(f"Successfully initiated clearing of all vectors from index '{self.index.name}'. Response: {delete_response}")
+            
+        except Exception as e:
+            print(f"Error clearing Pinecone index '{self.index.name}': {e}")
             raise
 
     def upsert(self, vectors: List[List[float]], metadata: List[Dict[str, Any]], ids: List[str]):
@@ -334,12 +349,21 @@ class IngestionPipeline:
             embedding_vector = chunk.get("embeddings")
             if embedding_vector is None:
                 print(f"Warning: Skipping chunk because it lacks embeddings. Metadata: {chunk.get('metadata', {})}")
-                continue 
+                continue
             chunk_meta = chunk.get("metadata", {}).copy()
-            chunk_meta["text"] = chunk.get("text", "") 
+            chunk_text_for_id = chunk.get("text", "")
+            
+            file_path_for_id = chunk_meta.get("file_path", chunk_meta.get("source", ""))
+            if not file_path_for_id: 
+                 print(f"Warning: Could not determine a unique document identifier for a chunk. Text: {chunk_text_for_id[:50]}... Using only text for ID.")
+
+            id_string = f"{file_path_for_id}::{chunk_text_for_id}"
+            deterministic_id = hashlib.sha256(id_string.encode('utf-8')).hexdigest()
+            
+            chunk_meta["text"] = chunk_text_for_id 
             embeddings.append(embedding_vector)
             metadata_list.append(chunk_meta)
-            ids.append(str(uuid.uuid4())) 
+            ids.append(deterministic_id) 
             successful_extractions += 1
 
         if not successful_extractions:
