@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, project_root)
@@ -43,6 +43,33 @@ def process_single_file(pipeline: IngestionPipeline, file_path: str, metadata: d
         print(f"!!! Error processing {os.path.basename(file_path)} after {duration:.2f} seconds: {e}")
         return False, file_path
 
+def auto_detect_cfa_metadata(file_path: str) -> Dict[str, Optional[str]]:
+    core_topics, specialized_pathways = get_valid_cfa_topics()
+    all_topics = core_topics + specialized_pathways
+
+    path_lower = file_path.lower()
+    detected_topic = None
+    for topic in all_topics:
+        search_term = topic.replace('_', ' ')
+        if search_term in path_lower:
+            detected_topic = topic
+            break       
+    if detected_topic:
+        cfa_topic = detected_topic
+        print(f"Auto-detected topic: {cfa_topic}")
+        if detected_topic in specialized_pathways:
+            cfa_pathway = detected_topic
+            print(f"Auto-detected pathway: {cfa_pathway}")
+        return {"cfa_topic": cfa_topic, "cfa_pathway": cfa_pathway}
+    else:
+        print("Could not auto-detect topic. Please specify with --topic.")
+        if not cfa_topic:  
+            print("Available topics:")
+            print("Core topics: " + ", ".join(core_topics))
+            print("Specialized pathways: " + ", ".join(specialized_pathways))
+            sys.exit(1)  
+        return {"cfa_topic": cfa_topic, "cfa_pathway": None}
+
 def main():
     
     load_dotenv()
@@ -51,120 +78,73 @@ def main():
     core_topics, specialized_pathways = get_valid_cfa_topics()
     all_topics = core_topics + specialized_pathways
 
-    parser = argparse.ArgumentParser(description="Ingest documents into the vector database.")
-    parser.add_argument("input_path", type=str, help="Path to the document file or directory to ingest.")
-    parser.add_argument("--topic", type=str, choices=all_topics, 
-                        help="CFA topic to associate with the document(s). One of: " + ", ".join(all_topics))
-    parser.add_argument("--pathway", type=str, choices=specialized_pathways,
-                        help="CFA specialized pathway (if applicable). One of: " + ", ".join(specialized_pathways))
-    parser.add_argument("--auto-detect", action="store_true", 
-                        help="Attempt to auto-detect CFA topic from filename or path.")
-    parser.add_argument("--strategy", type=str, default=None, choices=['fast', 'hi_res', 'ocr_only'],
-                        help="Unstructured parsing strategy to use.")
-    parser.add_argument("--chunk-size", type=int, default=None,
-                        help="Override chunk size from .env file.")
-    parser.add_argument("--chunk-overlap", type=int, default=None,
-                        help="Override chunk overlap from .env file.")
-    parser.add_argument("--workers", type=int, default=4,
-                        help="Number of parallel workers for processing files.")
-    parser.add_argument("--chunking-strategy", type=str, default="basic", 
-                        choices=["basic", "by_title", "by_page", "by_similarity"],
-                        help="Unstructured chunking strategy to use (default: basic).")
-    parser.add_argument("--embedding-provider", type=str, default=os.getenv("EMBEDDING_PROVIDER", "openai"),
-                        choices=["openai"], 
-                        help="Embedding provider to use (e.g., openai, huggingface).")
-    parser.add_argument("--embedding-model-name", type=str, default=os.getenv("EMBEDDING_MODEL_NAME", "text-embedding-3-large"),
-                        help="Name of the embedding model to use (e.g., text-embedding-3-large, sentence-transformers/all-MiniLM-L6-v2).")
+    parser = argparse.ArgumentParser(description="Ingest documents into the vector database using PageIndex.")
+    parser.add_argument("paths", nargs='+', help="Paths to the document(s) or director(y/ies) to ingest.")
+    parser.add_argument("--topic", help="CFA curriculum topic (e.g., 'asset_allocation').")
+    parser.add_argument("--pathway", help="CFA specialized pathway (e.g., 'portfolio_management').")
+    parser.add_argument("--auto-detect", action="store_true", help="Attempt to auto-detect CFA topic/pathway from file path/name.")
+    parser.add_argument("--embedding_provider", default=os.getenv("EMBEDDING_PROVIDER", "openai"), help="Embedding provider (default: openai or EMBEDDING_PROVIDER env var).")
+    parser.add_argument("--embedding_model_name", default=os.getenv("EMBEDDING_MODEL_NAME"), help="Name of the embedding model (e.g., text-embedding-3-large). Defaults to provider's default.")
+    parser.add_argument("--pageindex_dir", default=os.getenv("PAGEINDEX_DIR_PATH"), help="Path to the PageIndex directory. Defaults to PAGEINDEX_DIR_PATH env var.")
+
     args = parser.parse_args()
 
-    input_path = args.input_path
-    cfa_topic = args.topic
-    cfa_pathway = args.pathway
-    auto_detect = args.auto_detect
-
-    
-    if not os.path.exists(input_path):
-        print(f"Error: Input path does not exist: {input_path}")
-        sys.exit(1)
-
-    
-    if auto_detect and not cfa_topic:
-        print("Attempting to auto-detect CFA topic from path...")
-
-        path_lower = input_path.lower()
-        detected_topic = None
-        for topic in all_topics:
-            
-            search_term = topic.replace('_', ' ')
-            if search_term in path_lower:
-                detected_topic = topic
-                break       
-        if detected_topic:
-            cfa_topic = detected_topic
-            print(f"Auto-detected topic: {cfa_topic}")
-        else:
-            print("Could not auto-detect topic. Please specify with --topic.")
-            if not cfa_topic:  
-                print("Available topics:")
-                print("Core topics: " + ", ".join(core_topics))
-                print("Specialized pathways: " + ", ".join(specialized_pathways))
-                sys.exit(1)  
-        if detected_topic in specialized_pathways:
-            cfa_pathway = detected_topic
-            print(f"Auto-detected pathway: {cfa_pathway}")
-    if cfa_topic:
-        print(f"Using CFA topic: {cfa_topic}")
+    print("Starting ingestion process...")
+    print(f"Target paths: {args.paths}")
+    if args.topic: print(f"Specified CFA Topic: {args.topic}")
+    if args.pathway: print(f"Specified CFA Pathway: {args.pathway}")
+    if args.auto_detect: print("Auto-detection of CFA metadata enabled.")
+    print(f"Embedding Provider: {args.embedding_provider}")
+    if args.embedding_model_name: print(f"Embedding Model: {args.embedding_model_name}")
+    if args.pageindex_dir: 
+        print(f"PageIndex Directory: {args.pageindex_dir}")
     else:
-        print("No CFA topic specified. Documents will be ingested without topic classification.")    
-    if cfa_pathway:
-        if cfa_pathway not in specialized_pathways:
-            print(f"Warning: {cfa_pathway} is not a valid CFA pathway. Continuing anyway.")
-        print(f"Using CFA pathway: {cfa_pathway}")
+        print("PageIndex Directory: Not specified, will rely on IngestionPipeline default (env var or None).")
+
     try:
         pipeline = IngestionPipeline(
-            chunk_size_override=args.chunk_size,
-            chunk_overlap_override=args.chunk_overlap,
-            chunking_strategy_override=args.chunking_strategy,
             embedding_provider=args.embedding_provider,
-            embedding_model_name=args.embedding_model_name
+            embedding_model_name=args.embedding_model_name,
+            pageindex_dir_path=args.pageindex_dir
         )
     except Exception as e:
-        print(f"Error initializing Ingestion Pipeline: {e}")
+        print(f"Error initializing ingestion pipeline: {e}")
         sys.exit(1)
 
     files_to_process = []
-    if os.path.isfile(input_path):
-        files_to_process.append(input_path)
-    elif os.path.isdir(input_path):
-        print(f"Scanning directory: {input_path}")
-        for filename in os.listdir(input_path):
-            file_path = os.path.join(input_path, filename)
-            if os.path.isfile(file_path):
-                 if filename.lower().endswith(('.pdf', '.txt', '.md', '.docx', '.pptx')):
-                     files_to_process.append(file_path)
-                 else:
-                     print(f"Skipping non-document file: {filename}")
-            else:
-                print(f"Skipping non-file item: {filename}")
-    else:
-        print(f"Error: Input path is neither a file nor a directory: {input_path}")
-        sys.exit(1)
+    for path in args.paths:
+        if os.path.isfile(path):
+            files_to_process.append(path)
+        elif os.path.isdir(path):
+            print(f"Scanning directory: {path}")
+            for filename in os.listdir(path):
+                file_path = os.path.join(path, filename)
+                if os.path.isfile(file_path):
+                    if filename.lower().endswith(('.pdf', '.txt', '.md', '.docx', '.pptx')):
+                        files_to_process.append(file_path)
+                    else:
+                        print(f"Skipping non-document file: {filename}")
+                else:
+                    print(f"Skipping non-file item: {filename}")
+        else:
+            print(f"Error: Input path is neither a file nor a directory: {path}")
+            sys.exit(1)
 
     if not files_to_process:
         print("No files found to process.")
         sys.exit(0)
 
-    print(f"Found {len(files_to_process)} files to process with {args.workers} workers.")
+    print(f"Found {len(files_to_process)} files to process.")
 
     success_count = 0
     error_count = 0
     total_start_time = time.time()
 
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = []
         for file_path in files_to_process:
-            metadata = {"cfa_topic": cfa_topic, "cfa_pathway": cfa_pathway}
-            futures.append(executor.submit(process_single_file, pipeline, file_path, metadata, args.strategy))
+            metadata = auto_detect_cfa_metadata(file_path)
+            futures.append(executor.submit(process_single_file, pipeline, file_path, metadata, None))
 
         for future in as_completed(futures):
             try:

@@ -2,12 +2,11 @@ import os
 import uuid
 import sys
 import hashlib
+import subprocess
+import json
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from pinecone import Pinecone, ServerlessSpec
-from unstructured_client import UnstructuredClient
-from unstructured_client.models import shared, operations
-from unstructured_client.models.errors import SDKError
 from openai import OpenAI, APIError
 
 class VectorDBProvider:
@@ -113,19 +112,14 @@ load_dotenv()
 
 class IngestionPipeline:
     def __init__(self, 
-                 chunk_size_override: Optional[int] = None, 
-                 chunk_overlap_override: Optional[int] = None,
-                 chunking_strategy_override: Optional[str] = None,
                  embedding_provider: str = "openai",
-                 embedding_model_name: Optional[str] = None):
-        print("Initializing Ingestion Pipeline...")
+                 embedding_model_name: Optional[str] = None,
+                 pageindex_dir_path: Optional[str] = None):
+        print("Initializing Ingestion Pipeline (PageIndex-only mode)...")
         self.embedding_provider_name = embedding_provider.lower()
         self.embedding_model = embedding_model_name or self._get_default_embedding_model(self.embedding_provider_name)
         
-        self.unstructured_api_key = os.getenv("UNSTRUCTURED_API_KEY")
-        if not self.unstructured_api_key:
-            raise ValueError("UNSTRUCTURED_API_KEY environment variable not set.")
-        self.unstructured_client = UnstructuredClient(api_key_auth=self.unstructured_api_key)
+        print("Unstructured.io client is DISABLED in this PageIndex-only version.")
 
         self.openai_client = None
         if self.embedding_provider_name == "openai":
@@ -134,17 +128,19 @@ class IngestionPipeline:
                 raise ValueError("OPENAI_API_KEY environment variable not set for 'openai' embedding provider.")
             self.openai_client = OpenAI(api_key=openai_api_key)
             print("OpenAI client initialized.")
-        # TODO : Add similar blocks for other providers in future for perfomacne
         
         self.embedding_dimension = self._get_embedding_dimension(self.embedding_model)
         print(f"Using Embedding Provider (client-side): {self.embedding_provider_name}, Model: {self.embedding_model}, Dimension: {self.embedding_dimension}")
         
         self.vector_db_provider_name = "pinecone"
-        self.chunk_size = chunk_size_override if chunk_size_override is not None else int(os.getenv("CHUNK_SIZE", 1000))
-        self.chunk_overlap = chunk_overlap_override if chunk_overlap_override is not None else int(os.getenv("CHUNK_OVERLAP", 100))
-        self.chunking_strategy = chunking_strategy_override if chunking_strategy_override is not None else os.getenv("CHUNKING_STRATEGY", "basic")
-        print(f"Chunk Size: {self.chunk_size}, Overlap: {self.chunk_overlap}, Chunking Strategy: {self.chunking_strategy}")
         
+        self.pageindex_dir_path = pageindex_dir_path or os.getenv("PAGEINDEX_DIR_PATH")
+        if self.pageindex_dir_path:
+            self.pageindex_dir_path = os.path.abspath(self.pageindex_dir_path) 
+            print(f"PageIndex integration enabled. Directory: {self.pageindex_dir_path}")
+        else:
+            print("CRITICAL WARNING: PageIndex integration is DISABLED (PAGEINDEX_DIR_PATH not set). PDF parsing will FAIL.")
+
         self.vector_db_provider: VectorDBProvider = self._load_vector_db_provider()
 
     def _get_default_embedding_model(self, provider_name: str) -> str:
@@ -194,99 +190,140 @@ class IngestionPipeline:
         else:
             raise ValueError(f"Unsupported vector DB provider: {self.vector_db_provider_name}")
 
-    def parse_file(self, file_path: str, additional_metadata: Dict[str, Any] = None, strategy: Optional[str] = None) -> List[Dict[str, Any]]:
+    def _process_pageindex_node(self, node_data: Dict[str, Any], base_metadata: Dict[str, Any], elements_list: List[Dict[str, Any]]):
         """
-        Parses a local file using the Unstructured API partition endpoint,
-        then generates embeddings client-side.
-
-        Args:
-            file_path: Path to the local file.
-            additional_metadata: Optional metadata to add to each element.
-            strategy: Optional partitioning strategy (e.g., 'hi_res', 'fast').
-
-        Returns:
-            A list of dictionaries, each representing a structured element
-            with 'text', 'metadata', and 'embeddings' keys.
+        Recursively processes a node from PageIndex output and adds it to elements_list.
         """
-        print(f"Parsing file with Unstructured API: {file_path}" + (f" using strategy '{strategy}'" if strategy else ""))
+        node_text = node_data.get("summary", "")
+        if not node_text and node_data.get("title"):
+            node_text = node_data.get("title", "")
+
+        if node_text:
+            element_metadata = {
+                **base_metadata,
+                "pageindex_title": node_data.get("title"),
+                "pageindex_node_id": node_data.get("node_id"),
+                "pageindex_start_page": node_data.get("start_index"),
+                "pageindex_end_page": node_data.get("end_index"),
+                "processing_method": "pageindex"
+            }
+            cleaned_element_metadata = {k: v for k, v in element_metadata.items() if v is not None}
+            
+            elements_list.append({
+                "text": node_text,
+                "metadata": cleaned_element_metadata,
+            })
+
+        for child_node in node_data.get("nodes", []):
+            self._process_pageindex_node(child_node, base_metadata, elements_list)
+
+    def parse_file(self, file_path: str, additional_metadata: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+        """
+        Parses a local PDF file using PageIndex and generates embeddings client-side.
+        Other file types are not supported in this version.
+        """
+        print(f"Attempting to parse file with PageIndex: {file_path}")
+        
         if not os.path.exists(file_path):
             print(f"Error: File not found at {file_path}")
             return []
+
+        if not self.pageindex_dir_path:
+            print(f"Error: PageIndex directory not configured. Cannot parse PDF: {file_path}")
+            return []
+
+        if not file_path.lower().endswith(".pdf"):
+            print(f"Error: Only PDF files are supported in this pipeline version. Skipping: {file_path}")
+            return []
+
         if additional_metadata is None:
             additional_metadata = {}
+        
         base_metadata = {
             "source": os.path.basename(file_path),
             "file_path": file_path,
             **additional_metadata
         }
         
-        raw_elements = [] 
-
+        raw_elements: List[Dict[str, Any]] = [] 
+        
+        print(f"Processing PDF with PageIndex: {file_path}")
         try:
-            with open(file_path, "rb") as f:
-                files_arg = shared.Files(
-                    content=f.read(),
-                    file_name=os.path.basename(file_path)
-                )
-                partition_args = {
-                    "files": files_arg,
-                    "chunking_strategy": self.chunking_strategy,
-                    # "embedding_provider": self.embedding_provider_name,
-                    # "embedding_model_name": self.embedding_model,      
-                    # "embedding_api_key": self.embedding_api_key       
-                }
-                if self.chunk_size: 
-                    partition_args["max_characters"] = self.chunk_size
-                    partition_args["overlap"] = self.chunk_overlap
+            pageindex_script = os.path.join(self.pageindex_dir_path, "run_pageindex.py")
+            if not os.path.isfile(pageindex_script):
+                print(f"  Error: PageIndex script not found at {pageindex_script}")
+                raise FileNotFoundError(f"PageIndex script not found: {pageindex_script}")
 
-                partition_args = {k: v for k, v in partition_args.items() if v is not None}
-                
-                if strategy:
-                    partition_args["strategy"] = strategy
+            pdf_basename = os.path.splitext(os.path.basename(file_path))[0]
+            output_filename = f"{pdf_basename}_structure.json"
+            pageindex_results_dir = os.path.join(self.pageindex_dir_path, "results")
+            # Ensure results directory exists, PageIndex script might not create it.
+            os.makedirs(pageindex_results_dir, exist_ok=True)
+            output_json_path = os.path.join(pageindex_results_dir, output_filename)
+            
+            if os.path.exists(output_json_path): 
+                print(f"  Removing existing PageIndex output: {output_json_path}")
+                os.remove(output_json_path)
 
-                log_args = partition_args.copy()
-                if 'files' in log_args and hasattr(log_args['files'], 'file_name'):
-                     log_args['files'] = f"<file content for {log_args['files'].file_name}>"
+            cmd = [
+                "python3", pageindex_script,
+                "--pdf_path", os.path.abspath(file_path), 
+                "--output_dir", pageindex_results_dir, # Explicitly tell PageIndex where to save
+                "--if-add-node-summary", "yes"
+            ]
+            print(f"  Executing PageIndex: {' '.join(cmd)}")
+            process_result = subprocess.run(cmd, capture_output=True, text=True, cwd=self.pageindex_dir_path, check=False)
+
+            if process_result.returncode == 0:
+                print(f"  PageIndex script completed successfully.")
+                if os.path.exists(output_json_path):
+                    print(f"  Reading PageIndex output from: {output_json_path}")
+                    with open(output_json_path, 'r', encoding='utf-8') as f:
+                        pageindex_data = json.load(f)
+                    
+                    if isinstance(pageindex_data, dict):
+                        if "page_nodes" in pageindex_data and isinstance(pageindex_data["page_nodes"], list):
+                            for node in pageindex_data["page_nodes"]:
+                                self._process_pageindex_node(node, base_metadata, raw_elements)
+                        elif "title" in pageindex_data and "node_id" in pageindex_data : 
+                            self._process_pageindex_node(pageindex_data, base_metadata, raw_elements)
+                        else: 
+                            if "document_description" in pageindex_data:
+                                 print(f"  Document description found (length {len(pageindex_data['document_description'])}), not adding as a separate chunk.")
+                            if "nodes" in pageindex_data and isinstance(pageindex_data["nodes"], list):
+                                 for node in pageindex_data["nodes"]: 
+                                     self._process_pageindex_node(node, base_metadata, raw_elements)
+                            elif not raw_elements:
+                                 print(f"  Warning: PageIndex output JSON is a dict but known structures (e.g. page_nodes, root node with title/node_id) not found or empty. Dict keys: {list(pageindex_data.keys())}")
+                    elif isinstance(pageindex_data, list): 
+                        for node in pageindex_data:
+                            self._process_pageindex_node(node, base_metadata, raw_elements)
+                    else:
+                        print(f"  Warning: PageIndex output JSON is not a dict or list. Type: {type(pageindex_data)}")
+
+                    if raw_elements:
+                        print(f"  Successfully processed {len(raw_elements)} elements from PageIndex.")
+                    else:
+                        print(f"  Warning: PageIndex processing resulted in zero elements from JSON content.")
+                        if process_result.stdout: print(f"  PageIndex stdout:\n{process_result.stdout}")
+                        if process_result.stderr: print(f"  PageIndex stderr:\n{process_result.stderr}")
                 else:
-                     log_args['files'] = "<binary file content>"
-
-                print(f"Sending {os.path.basename(file_path)} to Unstructured partition endpoint with config: {log_args}...")
-
-                req = operations.PartitionRequest(
-                    partition_parameters=shared.PartitionParameters(**partition_args)
-                )
-                response = self.unstructured_client.general.partition(request=req)
-
-            if response.elements:
-                print(f"Received {len(response.elements)} elements from Unstructured.")
-                for element_dict in response.elements:
-                    element_text = element_dict.get('text', '')
-                    element_type = element_dict.get('type', 'Unknown')
-                    element_metadata = element_dict.get('metadata', {})
-                    combined_metadata = {
-                        **base_metadata,
-                        **element_metadata,
-                        "element_type": element_type,
-                    }
-                    cleaned_metadata = {k: v for k, v in combined_metadata.items() if v is not None}
-                    raw_elements.append({ 
-                        "text": element_text,
-                        "metadata": cleaned_metadata,
-                    })
+                    print(f"  Error: PageIndex output file not found at {output_json_path} despite successful run.")
+                    if process_result.stdout: print(f"  PageIndex stdout:\n{process_result.stdout}")
+                    if process_result.stderr: print(f"  PageIndex stderr:\n{process_result.stderr}")
             else:
-                print(f"Warning: Unstructured API returned no elements for {file_path}")
-                return []
-
-        except SDKError as e:
-            print(f"Unstructured SDK Error processing {file_path}: {e}")
-            return []
+                print(f"  Error: PageIndex script failed with return code {process_result.returncode}.")
+                if process_result.stdout: print(f"  PageIndex stdout:\n{process_result.stdout}")
+                if process_result.stderr: print(f"  PageIndex stderr:\n{process_result.stderr}")
+        except FileNotFoundError as fnf_error:
+            print(f"  File not found error during PageIndex setup: {fnf_error}")
         except Exception as e:
-            print(f"Unexpected error processing {file_path} with Unstructured: {e}")
+            print(f"  Exception during PageIndex processing for {file_path}: {e}")
             import traceback
             traceback.print_exc()
-            return []
-
+        
         if not raw_elements:
+            print(f"No elements extracted from PDF {file_path} using PageIndex.")
             return []
 
         final_elements_with_embeddings = []
@@ -376,42 +413,22 @@ class IngestionPipeline:
             self.vector_db_provider.upsert(vectors=embeddings, metadata=metadata_list, ids=ids)
             print(f"Successfully stored {len(ids)} chunks.")
 
-            # ---- DEBUG CODE  ----
-            # if ids and hasattr(self.vector_db_provider, 'index') and self.vector_db_provider.index is not None:
-            #     print(f"\n--- DEBUG: Fetching vector with ID: {ids[0]} to inspect its metadata ---")
-            #     try:
-            #         fetch_response = self.vector_db_provider.index.fetch(ids=[ids[0]])
-            #         print(f"DEBUG: Fetch response: {fetch_response}")
-            #         if fetch_response and fetch_response.vectors:
-            #             for vector_id, vector_data in fetch_response.vectors.items():
-            #                 print(f"  Vector ID: {vector_id}")
-            #                 print(f"  Metadata: {vector_data.metadata}")
-            #                 # print(f"  Values: {vector_data.values}") # Optional: to see the vector values
-            #         else:
-            #             print("DEBUG: Vector not found or empty response.")
-            #     except Exception as e:
-            #         print(f"DEBUG: Error fetching vector by ID: {e}")
-            #     print("--- DEBUG: Halting after first successful store_chunks for inspection. REMOVE THIS FOR NORMAL OPERATION. ---")
-            #     sys.exit(0) # Or raise Exception("Debug halt")
-            # ---- DEBUG CODE END ----
-
         except Exception as e:
             print(f"Error storing chunks in vector DB: {e}")
 
-    def run(self, file_path: str, metadata: Dict[str, Any] = None, strategy: Optional[str] = None):
+    def run(self, file_path: str, metadata: Dict[str, Any] = None):
         """Runs the full ingestion pipeline for a single file."""
         print(f"\n----- Starting pipeline for: {file_path} -----")
         if metadata:
             print(f"Using provided metadata: {metadata}")
 
-        
-        elements_with_embeddings = self.parse_file(file_path, additional_metadata=metadata, strategy=strategy)
+        elements_with_embeddings = self.parse_file(file_path, additional_metadata=metadata)
         if not elements_with_embeddings:
-            print(f"Pipeline halted for {file_path}: No elements parsed/returned by API.")
+            print(f"Pipeline halted for {file_path}: No elements parsed/returned by PageIndex.")
             return
         
         if elements_with_embeddings[0].get("embeddings") is None:
-            print(f"Warning: Unstructured API did not return embeddings for the first element of {file_path}. Check API configuration and subscription. Skipping storage.")
+            print(f"Warning: PageIndex did not return embeddings for the first element of {file_path}. Check PageIndex configuration and subscription. Skipping storage.")
             return
         
         chunks_with_embeddings = elements_with_embeddings
